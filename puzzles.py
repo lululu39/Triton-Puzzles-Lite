@@ -216,6 +216,8 @@ def add_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     off_x = tl.arange(0, B0)
     x = tl.load(x_ptr + off_x)
     # Finish me!
+    x = x + 10.0
+    tl.store(z_ptr + off_x, x)
     return
 
 
@@ -237,6 +239,11 @@ def add2_spec(x: Float32[200,]) -> Float32[200,]:
 @triton.jit
 def add_mask2_kernel(x_ptr, z_ptr, N0, B0: tl.constexpr):
     # Finish me!
+    idx = tl.program_id(0)
+    range = tl.arange(0, B0) + idx * B0
+    x = tl.load(x_ptr + range, range < N0)
+    x = x + 10.0
+    tl.store(z_ptr + range, x, range < N0)
     return
 
 
@@ -260,6 +267,14 @@ def add_vec_spec(x: Float32[32,], y: Float32[32,]) -> Float32[32, 32]:
 @triton.jit
 def add_vec_kernel(x_ptr, y_ptr, z_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    off_x = tl.arange(0, B0)
+    off_y = tl.arange(0, B1)
+    range = off_y[:, None] * B0 + off_x[None, :]
+    x = tl.load(x_ptr + off_x)
+    y = tl.load(y_ptr + off_y)
+    z = x[None, :] + y[:, None]
+    tl.store(z_ptr + range, z)
+
     return
 
 
@@ -286,6 +301,14 @@ def add_vec_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    off_x = tl.arange(0, B0) + block_id_x * B0
+    off_y = tl.arange(0, B1) + block_id_y * B1
+    range = off_y[:, None] * N0 + off_x[None, :]
+    x = tl.load(x_ptr + off_x, off_x < N0)
+    y = tl.load(y_ptr + off_y, off_y < N1)
+    z = x[None, :] + y[:, None]
+    # NOTE: note that the mask should also be broadcast here
+    tl.store(z_ptr + range, z, (off_x < N0)[None, :] & (off_y < N1)[:, None])
     # Finish me!
     return
 
@@ -313,6 +336,16 @@ def mul_relu_block_kernel(
 ):
     block_id_x = tl.program_id(0)
     block_id_y = tl.program_id(1)
+    off_x = tl.arange(0, B0) + block_id_x * B0
+    off_y = tl.arange(0, B1) + block_id_y * B1
+    mask_x = off_x < N0
+    mask_y = off_y < N1
+    range = off_y[:, None] * N0 + off_x
+    x = tl.load(x_ptr + off_x, mask_x)
+    y = tl.load(y_ptr + off_y, mask_y)
+    z = x[None, :] * y[:, None]
+    z = tl.maximum(z, 0) # relu
+    tl.store(z_ptr + range, z, mask_y[:, None] & mask_x[None, :])
     # Finish me!
     return
 
@@ -351,9 +384,23 @@ def mul_relu_block_back_spec(
 def mul_relu_block_back_kernel(
     x_ptr, y_ptr, dz_ptr, dx_ptr, N0, N1, B0: tl.constexpr, B1: tl.constexpr
 ):
+    # NOTE: for elements with the same shape (like dz and x), we use the same mapping for blocks
     block_id_i = tl.program_id(0)
     block_id_j = tl.program_id(1)
-    # Finish me!
+    off_i = tl.arange(0, B0) + block_id_i * B0
+    off_j = tl.arange(0, B1) + block_id_j * B1
+    mask_i = off_i < N0
+    mask_j = off_j < N1
+    range = off_j[:, None] * N0 + off_i[None, :]
+    mask = mask_j[:, None] & mask_i[None, :]
+    dz = tl.load(dz_ptr + range, mask)
+    x = tl.load(x_ptr + range, mask)
+    y = tl.load(y_ptr + off_j, mask_j)
+    # NOTE: here we take relu regrd to x * y, not x
+    relu_grad_mask = tl.where((x * y[:, None]) > 0, 1, 0)
+    dz_relu = dz * relu_grad_mask # N1 x N0
+    dx = dz_relu * y[:, None]
+    tl.store(dx_ptr + range, dx, mask)
     return
 
 
@@ -379,6 +426,21 @@ def sum_spec(x: Float32[4, 200]) -> Float32[4,]:
 @triton.jit
 def sum_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     # Finish me!
+    # NOTE: here i is row and j is col, different from above function
+    block_id_i = tl.program_id(0)
+    off_i = tl.arange(0, B0) + block_id_i * B0
+    mask_i = off_i < N0
+    z =  tl.zeros([B0], dtype=tl.float32)
+    for j in tl.range(0, T, B1):
+        off_j = j + tl.arange(0, B1)
+        range = off_i[:, None] * T + off_j[None, :]
+        mask_j = off_j < T
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + range, mask)
+        z += tl.sum(x, 1)
+    
+    tl.store(z_ptr + off_i, z, mask_i)
+
     return
 
 
@@ -419,7 +481,38 @@ def softmax_kernel(x_ptr, z_ptr, N0, N1, T, B0: tl.constexpr, B1: tl.constexpr):
     """2 loops ver."""
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
-    # Finish me!
+    # NOTE: we should use online softmax for fewer loop
+    off_i = tl.arange(0, B0) + block_id_i * B0
+    mask_i = off_i < N0
+
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    # max value should be -inf
+    max_val = tl.full([B0], -float("inf"), dtype=tl.float32)
+    new_max_val = tl.full([B0], -float("inf"), dtype=tl.float32)
+
+    # First loop, we get the max val and the sum exp, no control flow
+    for j in tl.range(0, T, B1):
+        off_j = j + tl.arange(0, B1)
+        mask_j = off_j < T
+        range = off_i[:, None] * T + off_j[None, :]
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + range, mask)
+        new_max_val = tl.maximum(max_val, tl.max(x, axis=1))
+        new_exp_sum = tl.sum(tl.exp2(log2_e * (x - new_max_val[:, None])), axis=1)
+        scalar = tl.exp2(log2_e * (max_val - new_max_val))
+        exp_sum = exp_sum * scalar + new_exp_sum
+        max_val = new_max_val
+    
+    # Second loop, we perform actual softmax
+    for j in tl.range(0, T, B1):
+        off_j = j + tl.arange(0, B1)
+        mask_j = off_j < T
+        range = off_i[:, None] * T + off_j[None, :]
+        mask = mask_i[:, None] & mask_j[None, :]
+        x = tl.load(x_ptr + range, mask)
+        z = tl.exp2(log2_e * (x - new_max_val[:, None])) / exp_sum[:, None]
+        tl.store(z_ptr + range, z, mask)
+
     return
 
 
@@ -468,7 +561,38 @@ def flashatt_kernel(
     block_id_i = tl.program_id(0)
     log2_e = 1.44269504
     myexp = lambda x: tl.exp2(log2_e * x)
-    # Finish me!
+    # NOTE: This is a scalar version since the hidden dimension is 1
+    off_i = tl.arange(0, B0) + block_id_i * B0
+    mask_i = off_i < N0
+    exp_sum = tl.zeros([B0], dtype=tl.float32)
+    # max value should be -inf
+    max_val = tl.full([B0], -float("inf"), dtype=tl.float32)
+    new_max_val = tl.full([B0], -float("inf"), dtype=tl.float32)
+
+    q = tl.load(q_ptr + off_i, mask_i)
+    z = tl.zeros([B0], dtype=tl.float32)
+
+    # 1 loop is fine if we have SRAM to contain the z
+    for j in tl.range(0, T, B1):
+        off_j = j + tl.arange(0, B1)
+        mask_j = off_j < T
+        k = tl.load(k_ptr + off_j, mask_j)
+        v = tl.load(v_ptr + off_j, mask_j)
+        qk_mul = q[:, None] * k[None, :] # [B0 X B1]
+        new_max_val = tl.maximum(max_val, tl.max(qk_mul, axis=1))
+        new_exp_sum = tl.sum(myexp(qk_mul - new_max_val[:, None]), axis=1)
+        scalar = myexp(max_val - new_max_val)
+        qk_exp = myexp(qk_mul - new_max_val[:, None]) # remember we should use the exp - max, not vanilla q times k
+        new_value = tl.sum(qk_exp * v[None, :], axis=1) # [B0]
+        z = z * scalar + new_value
+        max_val = new_max_val
+        exp_sum = exp_sum * scalar + new_exp_sum
+
+    z = z / exp_sum
+
+    tl.store(z_ptr + off_i, z, mask_i)
+
+
     return
 
 
